@@ -2,9 +2,8 @@
 
 # Bootstrap Redshift schema tables into S3 data lake.
 # Strategy:
-# - Detect append vs overwrite from SOURCE S3 layout:
-#   - keys containing "year=" and "month=" => append
-#   - otherwise => overwrite
+# - Classify append vs overwrite using an explicit append table list for this schema.
+# - Default mode is overwrite for tables not in append list.
 # - Append tables: unload historical data (< CURRENT_DATE) partitioned by year/month.
 # - Overwrite tables: unload current snapshot (single, non-partitioned prefix).
 # - Skip tables that already have objects in target S3 prefix.
@@ -21,8 +20,7 @@ schema_name <- Sys.getenv("BOOTSTRAP_SCHEMA", "powerbi")
 db_name <- Sys.getenv("BOOTSTRAP_DB_NAME", Sys.getenv("powerbi_db_name"))
 target_bucket <- Sys.getenv("BOOTSTRAP_TARGET_BUCKET", Sys.getenv("s3_data_lake_bucket"))
 target_root_prefix <- Sys.getenv("BOOTSTRAP_TARGET_ROOT_PREFIX", "")
-source_bucket <- Sys.getenv("BOOTSTRAP_SOURCE_BUCKET", Sys.getenv("s3_data_lake_bucket"))
-source_root_prefix <- Sys.getenv("BOOTSTRAP_SOURCE_ROOT_PREFIX", "")
+append_tables_csv <- Sys.getenv("BOOTSTRAP_APPEND_TABLES", "")
 
 if (identical(db_name, "")) {
   stop("Missing database name. Set BOOTSTRAP_DB_NAME or powerbi_db_name.")
@@ -32,16 +30,8 @@ if (identical(target_bucket, "")) {
   stop("Missing target S3 bucket. Set BOOTSTRAP_TARGET_BUCKET or s3_data_lake_bucket.")
 }
 
-if (identical(source_bucket, "")) {
-  stop("Missing source S3 bucket. Set BOOTSTRAP_SOURCE_BUCKET or s3_data_lake_bucket.")
-}
-
 if (!identical(target_root_prefix, "") && !endsWith(target_root_prefix, "/")) {
   target_root_prefix <- paste0(target_root_prefix, "/")
-}
-
-if (!identical(source_root_prefix, "") && !endsWith(source_root_prefix, "/")) {
-  source_root_prefix <- paste0(source_root_prefix, "/")
 }
 
 message("Loading AWS credentials and IAM role...")
@@ -87,39 +77,25 @@ s3_prefix_has_objects <- function(bucket, prefix) {
   !(value %in% c("", "0", "None", "null", "NULL"))
 }
 
-detect_table_mode_from_source_s3 <- function(bucket, prefix) {
-  cmd <- c(
-    "s3api", "list-objects-v2",
-    "--bucket", bucket,
-    "--prefix", prefix,
-    "--max-items", "1000",
-    "--query", "Contents[].Key",
-    "--output", "text"
-  )
-
-  out <- system2("aws", cmd, stdout = TRUE, stderr = TRUE)
-  status <- attr(out, "status")
-  if (!is.null(status) && status != 0) {
-    stop(glue("AWS CLI failed while detecting mode for s3://{bucket}/{prefix}\n{paste(out, collapse = '\n')}"))
-  }
-
-  keys_blob <- paste(out, collapse = "\n")
-  if (identical(trimws(keys_blob), "")) {
-    return("overwrite")
-  }
-
-  has_year_month_partitions <-
-    grepl("(^|/)year=[^/]+/month=[^/]+(/|$)", keys_blob, perl = TRUE)
-
-  if (has_year_month_partitions) "append" else "overwrite"
-}
-
 resolve_append_date_col <- function(table_cols) {
   candidates <- c("report_date", "downloaded_at", "date", "created_at", "updated_at")
   match <- candidates[candidates %in% table_cols]
   if (length(match) == 0) return(NA_character_)
   match[[1]]
 }
+
+parse_append_tables <- function(raw_value) {
+  if (identical(trimws(raw_value), "")) {
+    return(character())
+  }
+  parts <- strsplit(raw_value, ",", fixed = TRUE)[[1]]
+  out <- trimws(parts)
+  out <- out[out != ""]
+  unique(out)
+}
+
+append_tables <- parse_append_tables(append_tables_csv)
+message(glue("Configured append tables: {length(append_tables)}"))
 
 message(glue("Connecting to Redshift db '{db_name}'..."))
 con <- get_redshift_connection(db_name = db_name)
@@ -154,9 +130,7 @@ for (table_name in all_tables) {
     next
   }
 
-  source_prefix <- paste0(source_root_prefix, schema_name, "/", table_name, "/")
   target_prefix <- paste0(target_root_prefix, schema_name, "/", table_name, "/")
-  source_uri <- glue("s3://{source_bucket}/{source_prefix}")
   target_uri <- glue("s3://{target_bucket}/{target_prefix}")
 
   message("\n---------------------------------------------------")
@@ -176,14 +150,8 @@ for (table_name in all_tables) {
     next
   }
 
-  mode <- tryCatch(
-    detect_table_mode_from_source_s3(source_bucket, source_prefix),
-    error = function(e) {
-      warning(glue("Could not detect mode from source prefix {source_uri}: {e$message}"))
-      "overwrite"
-    }
-  )
-  message(glue("Detected mode from source layout: {mode} ({source_uri})"))
+  mode <- if (table_name %in% append_tables) "append" else "overwrite"
+  message(glue("Detected mode from append list: {mode}"))
 
   query <- NULL
   if (mode == "append") {
