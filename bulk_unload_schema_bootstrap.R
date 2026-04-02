@@ -2,6 +2,9 @@
 
 # Bootstrap Redshift schema tables into S3 data lake.
 # Strategy:
+# - Detect append vs overwrite from SOURCE S3 layout:
+#   - keys containing "year=" and "month=" => append
+#   - otherwise => overwrite
 # - Append tables: unload historical data (< CURRENT_DATE) partitioned by year/month.
 # - Overwrite tables: unload current snapshot (single, non-partitioned prefix).
 # - Skip tables that already have objects in target S3 prefix.
@@ -18,6 +21,8 @@ schema_name <- Sys.getenv("BOOTSTRAP_SCHEMA", "powerbi")
 db_name <- Sys.getenv("BOOTSTRAP_DB_NAME", Sys.getenv("powerbi_db_name"))
 target_bucket <- Sys.getenv("BOOTSTRAP_TARGET_BUCKET", Sys.getenv("s3_data_lake_bucket"))
 target_root_prefix <- Sys.getenv("BOOTSTRAP_TARGET_ROOT_PREFIX", "")
+source_bucket <- Sys.getenv("BOOTSTRAP_SOURCE_BUCKET", Sys.getenv("s3_data_lake_bucket"))
+source_root_prefix <- Sys.getenv("BOOTSTRAP_SOURCE_ROOT_PREFIX", "")
 
 if (identical(db_name, "")) {
   stop("Missing database name. Set BOOTSTRAP_DB_NAME or powerbi_db_name.")
@@ -27,8 +32,16 @@ if (identical(target_bucket, "")) {
   stop("Missing target S3 bucket. Set BOOTSTRAP_TARGET_BUCKET or s3_data_lake_bucket.")
 }
 
+if (identical(source_bucket, "")) {
+  stop("Missing source S3 bucket. Set BOOTSTRAP_SOURCE_BUCKET or s3_data_lake_bucket.")
+}
+
 if (!identical(target_root_prefix, "") && !endsWith(target_root_prefix, "/")) {
   target_root_prefix <- paste0(target_root_prefix, "/")
+}
+
+if (!identical(source_root_prefix, "") && !endsWith(source_root_prefix, "/")) {
+  source_root_prefix <- paste0(source_root_prefix, "/")
 }
 
 message("Loading AWS credentials and IAM role...")
@@ -48,24 +61,6 @@ Sys.setenv(
   AWS_ACCESS_KEY_ID = config$scripts$aws$access_key_id,
   AWS_SECRET_ACCESS_KEY = config$scripts$aws$secret_access_key,
   AWS_DEFAULT_REGION = config$scripts$aws$region_name
-)
-
-# Master append dictionary: table -> date column
-append_date_map <- c(
-  ai_podcast_ga4_events = "date",
-  ai_podcast_usage = "date",
-  ai_podcasts = "downloaded_at",
-  tracking_activity = "report_date",
-  decockpit_b2c_users = "downloaded_at",
-  tracking_abos = "downloaded_at",
-  csm_activity = "report_date",
-  csm_ai_questions = "downloaded_at",
-  csm_assignments = "downloaded_at",
-  csm_j_users = "downloaded_at",
-  concept_pages_dau_mau = "report_date",
-  ai_flashcards_dau_mau = "report_date",
-  b2u_dau_mau_logins = "report_date",
-  qbank_attempt_questions = "downloaded_at"
 )
 
 is_valid_identifier <- function(x) {
@@ -90,6 +85,40 @@ s3_prefix_has_objects <- function(bucket, prefix) {
 
   value <- trimws(paste(out, collapse = "\n"))
   !(value %in% c("", "0", "None", "null", "NULL"))
+}
+
+detect_table_mode_from_source_s3 <- function(bucket, prefix) {
+  cmd <- c(
+    "s3api", "list-objects-v2",
+    "--bucket", bucket,
+    "--prefix", prefix,
+    "--max-items", "1000",
+    "--query", "Contents[].Key",
+    "--output", "text"
+  )
+
+  out <- system2("aws", cmd, stdout = TRUE, stderr = TRUE)
+  status <- attr(out, "status")
+  if (!is.null(status) && status != 0) {
+    stop(glue("AWS CLI failed while detecting mode for s3://{bucket}/{prefix}\n{paste(out, collapse = '\n')}"))
+  }
+
+  keys_blob <- paste(out, collapse = "\n")
+  if (identical(trimws(keys_blob), "")) {
+    return("overwrite")
+  }
+
+  has_year_month_partitions <-
+    grepl("(^|/)year=[^/]+/month=[^/]+(/|$)", keys_blob, perl = TRUE)
+
+  if (has_year_month_partitions) "append" else "overwrite"
+}
+
+resolve_append_date_col <- function(table_cols) {
+  candidates <- c("report_date", "downloaded_at", "date", "created_at", "updated_at")
+  match <- candidates[candidates %in% table_cols]
+  if (length(match) == 0) return(NA_character_)
+  match[[1]]
 }
 
 message(glue("Connecting to Redshift db '{db_name}'..."))
@@ -125,7 +154,9 @@ for (table_name in all_tables) {
     next
   }
 
+  source_prefix <- paste0(source_root_prefix, schema_name, "/", table_name, "/")
   target_prefix <- paste0(target_root_prefix, schema_name, "/", table_name, "/")
+  source_uri <- glue("s3://{source_bucket}/{source_prefix}")
   target_uri <- glue("s3://{target_bucket}/{target_prefix}")
 
   message("\n---------------------------------------------------")
@@ -145,12 +176,17 @@ for (table_name in all_tables) {
     next
   }
 
-  mode <- if (table_name %in% names(append_date_map)) "append" else "overwrite"
+  mode <- tryCatch(
+    detect_table_mode_from_source_s3(source_bucket, source_prefix),
+    error = function(e) {
+      warning(glue("Could not detect mode from source prefix {source_uri}: {e$message}"))
+      "overwrite"
+    }
+  )
+  message(glue("Detected mode from source layout: {mode} ({source_uri})"))
 
   query <- NULL
   if (mode == "append") {
-    date_col <- append_date_map[[table_name]]
-
     cols_sql <- glue("
       SELECT column_name
       FROM information_schema.columns
@@ -158,10 +194,11 @@ for (table_name in all_tables) {
         AND table_name = '{table_name}'
     ")
     table_cols <- DBI::dbGetQuery(con, cols_sql)$column_name
+    date_col <- resolve_append_date_col(table_cols)
 
-    if (!(date_col %in% table_cols)) {
+    if (is.na(date_col)) {
       warning(glue(
-        "Configured append date column '{date_col}' not found in {table_name}. Falling back to overwrite mode."
+        "Mode detected as append for {table_name}, but no supported date column found. Falling back to overwrite mode."
       ))
       mode <- "overwrite"
     } else {
@@ -180,6 +217,7 @@ for (table_name in all_tables) {
         PARTITION BY (year, month)
         ALLOWOVERWRITE;
       ")
+      message(glue("Using append date column: {date_col}"))
     }
   }
 
