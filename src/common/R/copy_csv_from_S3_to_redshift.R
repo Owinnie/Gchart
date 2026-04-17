@@ -10,9 +10,12 @@ copy_csv_from_S3_to_redshift <- function(db_name, schema, table_name, s3_bucket,
   config <- yaml::read_yaml(secret_yaml_file_path, readLines.warn = FALSE)
 
   con <- get_redshift_connection(db_name = db_name, redshift_type = redshift_type)
+  if (!inherits(con, "DBIConnection")) {
+    stop("Failed to get a valid Redshift DBI connection.")
+  }
 
   # close connection on exit of function, also in case of error
-  on.exit(dbDisconnect(con))
+  on.exit(DBI::dbDisconnect(con))
 
   if (overwrite) {
     # truncate tables before copying, since COPY statement appends to table
