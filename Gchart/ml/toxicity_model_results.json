@@ -1,0 +1,75 @@
+{
+  "frame_rows": 23244,
+  "positive_rate": 0.47190672861813804,
+  "feature_columns": [
+    "fills_early",
+    "mean_mo60_early",
+    "std_mo60_early",
+    "mean_notional_early",
+    "mean_imb_early",
+    "mean_start_pos_early"
+  ],
+  "wallet_split": {
+    "10": {
+      "n": 8059,
+      "positive_rate": 0.47685817098895644,
+      "baseline_auc_mean": 0.5098126753638583,
+      "baseline_auc_std": 0.009003991857499312,
+      "model_auc_mean": 0.5454552993699242,
+      "model_auc_std": 0.008623705767822053,
+      "improvement": 0.03564262400606588
+    },
+    "50": {
+      "n": 1859,
+      "positive_rate": 0.5067240451855837,
+      "baseline_auc_mean": 0.5547664865665014,
+      "baseline_auc_std": 0.03770405108861333,
+      "model_auc_mean": 0.6351602398046037,
+      "model_auc_std": 0.022369981707859372,
+      "improvement": 0.08039375323810227
+    },
+    "100": {
+      "n": 960,
+      "positive_rate": 0.559375,
+      "baseline_auc_mean": 0.6100816671360181,
+      "baseline_auc_std": 0.02177489038421591,
+      "model_auc_mean": 0.6761757251478456,
+      "model_auc_std": 0.02807642160444583,
+      "improvement": 0.06609405801182755
+    }
+  },
+  "holdout_coin": {
+    "50": {
+      "BTC_to_ETH": {
+        "n_train": 1053,
+        "n_test": 806,
+        "baseline_auc": 0.6063596423473581,
+        "model_auc": 0.6355131524472759,
+        "improvement": 0.029153510099917845
+      },
+      "ETH_to_BTC": {
+        "n_train": 806,
+        "n_test": 1053,
+        "baseline_auc": 0.5274912476991374,
+        "model_auc": 0.5512217129245317,
+        "improvement": 0.023730465225394348
+      }
+    },
+    "100": {
+      "BTC_to_ETH": {
+        "n_train": 484,
+        "n_test": 476,
+        "baseline_auc": 0.6415398550724638,
+        "model_auc": 0.676304347826087,
+        "improvement": 0.034764492753623144
+      },
+      "ETH_to_BTC": {
+        "n_train": 476,
+        "n_test": 484,
+        "baseline_auc": 0.5807776231465732,
+        "model_auc": 0.6699139219627854,
+        "improvement": 0.08913629881621221
+      }
+    }
+  }
+}
