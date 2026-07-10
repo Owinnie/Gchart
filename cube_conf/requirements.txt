@@ -1,0 +1,3 @@
+# Minimal deps for access-rule generation inside the Cube image.
+# Extend to match your semantic-data-layer requirements.txt as needed.
+PyYAML>=6.0

@@ -1,0 +1,5 @@
+# Generated at Docker build / container start — do not commit injected artifacts
+cube_conf/access_rules.yaml
+cube_conf/logs/
+cubestore_data/
+.env
