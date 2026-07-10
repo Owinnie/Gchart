@@ -1,0 +1,12 @@
+# Stub config so Docker build can run generate_access_rules.py.
+# Replace with the full access_rules_config.yaml from semantic-data-layer.
+known_scopes:
+  - default
+  - admin
+
+public_directories: []
+public_cubes: []
+directory_scopes: {}
+special_cases: {}
+pii_dimensions: {}
+b2c_en_course_ids: []
