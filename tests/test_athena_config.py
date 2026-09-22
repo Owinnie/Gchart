@@ -8,7 +8,11 @@ from __future__ import annotations
 import unittest
 
 
-UNUSABLE_ATHENA_OUTPUT_BUCKETS = {"katrin-test"}
+ATHENA_REGION_DEFAULT = "eu-central-1"
+KATRIN_RESULTS_BUCKET = "katrin-test"
+KATRIN_RESULTS_PREFIX = "athena-results"
+KATRIN_RESULTS_URI = "s3://katrin-test/athena-results/"
+CUBE_RESULTS_URI = "s3://cube-athena-query-results-dev/"
 
 
 def get_env_value(name: str, env: dict[str, str] | None = None) -> str:
@@ -29,22 +33,18 @@ def extract_s3_bucket(uri: str) -> str:
     return path.split("/", 1)[0]
 
 
-def is_unusable_athena_output_bucket(bucket: str) -> bool:
-    if not bucket:
-        return True
-    return bucket.lower() in UNUSABLE_ATHENA_OUTPUT_BUCKETS
-
-
-def s3_uri_has_key_prefix(uri: str) -> bool:
+def extract_s3_key(uri: str) -> str:
     if not uri:
-        return False
+        return ""
     path = uri.strip()
     if path.lower().startswith("s3://"):
         path = path[5:]
-    return "/" in path
+    if "/" not in path:
+        return ""
+    return path.split("/", 1)[1]
 
 
-def normalize_s3_uri(value: str, db: str | None = None, query_results_prefix: bool = False) -> str:
+def normalize_s3_uri(value: str, db: str | None = None) -> str:
     if value is None or not str(value).strip():
         return ""
     uri = str(value).strip()
@@ -53,33 +53,50 @@ def normalize_s3_uri(value: str, db: str | None = None, query_results_prefix: bo
     uri = "s3://" + uri[5:]
     if not uri.endswith("/"):
         uri += "/"
-    if query_results_prefix and not uri.rstrip("/").endswith("athena-query-results"):
-        uri += "athena-query-results/"
-    if db:
-        if not uri.endswith(f"{db}/"):
-            uri += f"{db}/"
+    if db and not uri.endswith(f"{db}/"):
+        uri += f"{db}/"
     return uri
 
 
-def resolve_athena_region(secret_region: str | None = None, env: dict[str, str] | None = None) -> str:
+def ensure_allowed_athena_prefix(uri: str, db: str | None = None) -> str:
+    if not uri or not str(uri).strip():
+        return ""
+    bucket = extract_s3_bucket(uri).lower()
+    if bucket != KATRIN_RESULTS_BUCKET:
+        return normalize_s3_uri(uri, db=db)
+    key = extract_s3_key(uri)
+    if not (key == KATRIN_RESULTS_PREFIX or key.startswith(f"{KATRIN_RESULTS_PREFIX}/")):
+        uri = KATRIN_RESULTS_URI
+    return normalize_s3_uri(uri, db=db)
+
+
+def resolve_athena_region(
+    secret_region: str | None = None,
+    env: dict[str, str] | None = None,
+    staging_uri: str | None = None,
+) -> str:
     secret_value = (secret_region or "").strip()
     candidates = [
         get_env_value("AWS_REGION", env),
         get_env_value("AWS_DEFAULT_REGION", env),
         secret_value,
-        "eu-central-1",
+        ATHENA_REGION_DEFAULT,
     ]
-    return next(value for value in candidates if value)
+    region = next(value for value in candidates if value)
+    if extract_s3_bucket(staging_uri or "").lower() == KATRIN_RESULTS_BUCKET:
+        if region != ATHENA_REGION_DEFAULT:
+            return ATHENA_REGION_DEFAULT
+    return region
 
 
 def staging_candidates(explicit: str | None = None, env: dict[str, str] | None = None):
     return [
-        {"value": (explicit or "").strip(), "kind": "staging"},
-        {"value": get_env_value("AWS_ATHENA_S3_STAGING_DIR", env), "kind": "staging"},
-        {"value": get_env_value("s3_staging_dir", env), "kind": "staging"},
-        {"value": get_env_value("athena_s3_output_bucket", env), "kind": "data_bucket"},
-        {"value": get_env_value("s3_data_lake_bucket", env), "kind": "data_bucket"},
-        {"value": get_env_value("s3_to_redshift_bucket", env), "kind": "data_bucket"},
+        (explicit or "").strip(),
+        get_env_value("AWS_ATHENA_S3_STAGING_DIR", env),
+        get_env_value("s3_staging_dir", env),
+        get_env_value("athena_s3_output_bucket", env),
+        KATRIN_RESULTS_URI,
+        CUBE_RESULTS_URI,
     ]
 
 
@@ -88,28 +105,16 @@ def resolve_athena_s3_staging_dir(
     explicit: str | None = None,
     env: dict[str, str] | None = None,
 ) -> str:
-    skipped: list[str] = []
-    for candidate in staging_candidates(explicit=explicit, env=env):
-        raw = candidate["value"]
+    for raw in staging_candidates(explicit=explicit, env=env):
         if not raw:
             continue
-        bucket = extract_s3_bucket(raw)
-        if is_unusable_athena_output_bucket(bucket):
-            skipped.append(bucket)
-            continue
-        use_query_prefix = candidate["kind"] == "data_bucket" and not s3_uri_has_key_prefix(raw)
-        uri = normalize_s3_uri(raw, db=db, query_results_prefix=use_query_prefix)
-        if uri and not is_unusable_athena_output_bucket(extract_s3_bucket(uri)):
+        uri = ensure_allowed_athena_prefix(raw, db=db)
+        if uri:
             return uri
-
-    skipped_note = ""
-    if skipped:
-        skipped_note = f" Ignored leftover bucket(s): {', '.join(dict.fromkeys(skipped))}."
     raise ValueError(
-        "No usable Athena query-results bucket configured."
-        + skipped_note
-        + " Set s3_staging_dir or s3_data_lake_bucket in .Renviron to an existing S3 "
-        "bucket in the Athena region, then rebuild r-code:latest."
+        "No Athena query-results location configured. "
+        "Set s3_staging_dir=s3://katrin-test/athena-results/ in .Renviron, "
+        "then rebuild r-code:latest."
     )
 
 
@@ -124,55 +129,62 @@ class AthenaConfigTests(unittest.TestCase):
         self.assertEqual(resolve_athena_region("eu-west-1", env={}), "eu-west-1")
         self.assertEqual(resolve_athena_region(None, env={}), "eu-central-1")
 
-    def test_skips_katrin_test_and_uses_data_lake(self):
+    def test_katrin_test_forces_frankfurt_even_if_secrets_say_otherwise(self):
+        self.assertEqual(
+            resolve_athena_region(
+                "us-east-1",
+                env={},
+                staging_uri="s3://katrin-test/athena-results/powerbi_old/",
+            ),
+            "eu-central-1",
+        )
+
+    def test_rewrites_katrin_bucket_root_to_iam_prefix(self):
         uri = resolve_athena_s3_staging_dir(
             "powerbi_old",
-            env={
-                "s3_staging_dir": "s3://katrin-test/",
-                "s3_data_lake_bucket": "lecturio-datalake",
-                "AWS_REGION": "eu-central-1",
-            },
-        )
-        self.assertEqual(uri, "s3://lecturio-datalake/athena-query-results/powerbi_old/")
-
-    def test_skips_katrin_test_without_scheme(self):
-        uri = resolve_athena_s3_staging_dir(
-            "powerbi",
-            env={
-                "s3_staging_dir": "katrin-test",
-                "s3_to_redshift_bucket": "lecturio-redshift-staging",
-            },
-        )
-        self.assertEqual(uri, "s3://lecturio-redshift-staging/athena-query-results/powerbi/")
-
-    def test_uses_explicit_staging_dir_when_valid(self):
-        uri = resolve_athena_s3_staging_dir(
-            "powerbi_old",
-            explicit="s3://company-athena-results/queries",
             env={"s3_staging_dir": "s3://katrin-test/"},
         )
-        self.assertEqual(uri, "s3://company-athena-results/queries/powerbi_old/")
+        self.assertEqual(uri, "s3://katrin-test/athena-results/powerbi_old/")
 
-    def test_keeps_existing_db_suffix(self):
+    def test_rewrites_katrin_bucket_name_only(self):
+        uri = resolve_athena_s3_staging_dir(
+            "powerbi",
+            env={"s3_staging_dir": "katrin-test"},
+        )
+        self.assertEqual(uri, "s3://katrin-test/athena-results/powerbi/")
+
+    def test_rewrites_old_helper_db_suffix_outside_iam_prefix(self):
         uri = resolve_athena_s3_staging_dir(
             "powerbi_old",
-            env={"s3_staging_dir": "s3://company-athena-results/powerbi_old/"},
+            env={"s3_staging_dir": "s3://katrin-test/powerbi_old/"},
         )
-        self.assertEqual(uri, "s3://company-athena-results/powerbi_old/")
+        self.assertEqual(uri, "s3://katrin-test/athena-results/powerbi_old/")
 
-    def test_errors_when_only_katrin_test_is_configured(self):
-        with self.assertRaises(ValueError) as ctx:
-            resolve_athena_s3_staging_dir(
-                "powerbi",
-                env={"s3_staging_dir": "s3://katrin-test/"},
-            )
-        message = str(ctx.exception)
-        self.assertIn("katrin-test", message)
-        self.assertIn("s3_data_lake_bucket", message)
+    def test_keeps_existing_athena_results_prefix(self):
+        uri = resolve_athena_s3_staging_dir(
+            "powerbi_old",
+            env={"s3_staging_dir": "s3://katrin-test/athena-results/"},
+        )
+        self.assertEqual(uri, "s3://katrin-test/athena-results/powerbi_old/")
 
-    def test_extracts_bucket_name_from_uri(self):
-        self.assertEqual(extract_s3_bucket("s3://katrin-test/powerbi_old/"), "katrin-test")
-        self.assertEqual(extract_s3_bucket("katrin-test"), "katrin-test")
+    def test_defaults_to_katrin_athena_results_when_unset(self):
+        self.assertEqual(
+            resolve_athena_s3_staging_dir("powerbi_old", env={}),
+            "s3://katrin-test/athena-results/powerbi_old/",
+        )
+
+    def test_uses_explicit_non_katrin_staging_dir(self):
+        uri = resolve_athena_s3_staging_dir(
+            "powerbi_old",
+            explicit="s3://cube-athena-query-results-dev/queries",
+            env={"s3_staging_dir": "s3://katrin-test/"},
+        )
+        self.assertEqual(uri, "s3://cube-athena-query-results-dev/queries/powerbi_old/")
+
+    def test_extracts_bucket_and_key(self):
+        self.assertEqual(extract_s3_bucket("s3://katrin-test/athena-results/"), "katrin-test")
+        self.assertEqual(extract_s3_key("s3://katrin-test/athena-results/"), "athena-results/")
+        self.assertEqual(extract_s3_key("katrin-test"), "")
 
 
 if __name__ == "__main__":
